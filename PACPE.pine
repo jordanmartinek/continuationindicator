@@ -1,0 +1,749 @@
+//@version=6
+// ============================================================================
+// PACPE — Price Action Continuation Probability Engine
+// ----------------------------------------------------------------------------
+// A momentum-aware price-action analysis engine that estimates the likelihood
+// that price continues in its current direction over the next several candles.
+//
+// It is NOT a moving-average crossover, a bullish/bearish candle counter, or a
+// conventional trend-following tool. It continuously evaluates the balance
+// between directional continuation evidence and opposing (countertrend)
+// pressure, so that:
+//   * strong established momentum resists minor countertrend candles, while
+//   * repeated / violent countertrend evidence progressively erodes confidence.
+//
+// Design principles honoured here:
+//   - Confirmed-bar logic for all primary signals (no lookahead / repaint).
+//   - All features ATR-normalized so the engine adapts across instruments.
+//   - Scores are explicitly HEURISTIC; optional calibration reports empirical
+//     continuation rates per score bucket, clearly separated from the scores.
+//   - Bounded state with configurable persistence and decay (no permanent bias).
+//
+// See the README in this repository for full architecture documentation,
+// formulas, defaults for intraday futures, testing checklist, and limitations.
+// ============================================================================
+
+indicator("PACPE — Price Action Continuation Probability Engine", shorttitle = "PACPE", overlay = true, max_labels_count = 500, max_boxes_count = 50, max_lines_count = 50)
+
+// ============================================================================
+// SECTION 0 — INPUTS (grouped logically, sensible defaults)
+// ============================================================================
+var string GRP_LB   = "Lookback Windows"
+var string GRP_MOM  = "Momentum Engine"
+var string GRP_CT   = "Countertrend Penalty"
+var string GRP_PERS = "Persistence & Decay"
+var string GRP_ANAT = "Candle Anatomy / Efficiency Weights"
+var string GRP_STR  = "Structure & Pullback"
+var string GRP_REG  = "Volatility & Regime"
+var string GRP_SCR  = "Continuation Scoring & Thresholds"
+var string GRP_CAL  = "Historical Calibration"
+var string GRP_DASH = "Dashboard"
+var string GRP_VIS  = "Chart Visuals"
+var string GRP_ALR  = "Alerts"
+
+// --- Lookback windows -------------------------------------------------------
+i_fast   = input.int(5,  "Fast lookback",         minval = 2, maxval = 50,  group = GRP_LB, tooltip = "Short-term momentum / recent displacement window.")
+i_mid    = input.int(13, "Intermediate lookback", minval = 3, maxval = 100, group = GRP_LB)
+i_slow   = input.int(34, "Slow lookback",         minval = 5, maxval = 300, group = GRP_LB)
+i_atrLen = input.int(14, "ATR length",            minval = 2, maxval = 100, group = GRP_LB, tooltip = "ATR used to normalize ranges, bodies and displacement.")
+i_bodyAvgLen = input.int(20, "Average body length", minval = 2, maxval = 200, group = GRP_LB)
+
+// --- Momentum ---------------------------------------------------------------
+i_momSens   = input.float(1.0, "Momentum sensitivity", minval = 0.1, maxval = 3.0, step = 0.1, group = GRP_MOM, tooltip = "Scales how aggressively raw displacement maps to the -100..+100 momentum score.")
+i_consecW   = input.float(1.0, "Consecutive-candle weight", minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_MOM)
+i_effW_mom  = input.float(1.0, "Net-efficiency weight",     minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_MOM, tooltip = "Weight of net move / total path efficiency inside momentum.")
+
+// --- Countertrend penalty ---------------------------------------------------
+i_ctSens    = input.float(1.0, "Countertrend sensitivity", minval = 0.1, maxval = 3.0, step = 0.1, group = GRP_CT, tooltip = "Overall multiplier on countertrend penalties.")
+i_ctExp     = input.float(1.8, "Countertrend nonlinearity (exponent)", minval = 1.0, maxval = 3.0, step = 0.1, group = GRP_CT, tooltip = "Exponent >1 makes big opposing candles bite disproportionately harder than ordinary ones.")
+i_ctDampen  = input.float(0.6, "Momentum dampening of penalty", minval = 0.0, maxval = 1.0, step = 0.05, group = GRP_CT, tooltip = "How much strong established momentum shrinks the effect of a single minor countertrend candle (0 = none, 1 = maximum).")
+i_ctPersistW= input.float(1.0, "Countertrend persistence weight", minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_CT, tooltip = "Extra penalty when opposing pressure persists across several candles.")
+i_structBreakW = input.float(1.5, "Structure-break penalty weight", minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_CT)
+
+// --- Persistence & decay ----------------------------------------------------
+i_persAlpha = input.float(0.30, "Evidence persistence (alpha)", minval = 0.02, maxval = 0.9, step = 0.02, group = GRP_PERS, tooltip = "EMA-like smoothing of directional evidence. Higher = reacts faster, lower = more memory.")
+i_decay     = input.float(0.08, "Chop decay per bar", minval = 0.0, maxval = 0.5, step = 0.01, group = GRP_PERS, tooltip = "How fast confidence decays toward neutral when net directional progress is weak.")
+
+// --- Candle anatomy / efficiency weights ------------------------------------
+i_wBody    = input.float(1.0, "Body quality weight",        minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_ANAT)
+i_wClose   = input.float(1.0, "Close-location weight",      minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_ANAT)
+i_wEff     = input.float(1.0, "Directional efficiency weight", minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_ANAT)
+i_wWick    = input.float(1.0, "Wick rejection weight",      minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_ANAT)
+
+// --- Structure & pullback ---------------------------------------------------
+i_pivotLen = input.int(3, "Swing (pivot) sensitivity", minval = 1, maxval = 15, group = GRP_STR, tooltip = "Pivot left/right strength. Larger = fewer, more significant swings.")
+i_structLB = input.int(20, "Structure lookback", minval = 5, maxval = 200, group = GRP_STR)
+i_wStruct  = input.float(1.0, "Structure weight", minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_STR)
+i_pullShallow = input.float(0.33, "Shallow pullback threshold (frac of impulse)", minval = 0.05, maxval = 0.9, step = 0.01, group = GRP_STR)
+i_pullDeep    = input.float(0.66, "Deep pullback threshold (frac of impulse)",    minval = 0.1,  maxval = 1.0, step = 0.01, group = GRP_STR)
+
+// --- Volatility & regime ----------------------------------------------------
+i_wVol      = input.float(1.0, "Volatility weight", minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_REG)
+i_chopSens  = input.float(1.0, "Chop detection sensitivity", minval = 0.2, maxval = 3.0, step = 0.1, group = GRP_REG, tooltip = "Higher = more readily classifies overlapping, low-progress action as chop.")
+i_compressPct = input.float(0.65, "Compression ATR ratio", minval = 0.1, maxval = 1.0, step = 0.05, group = GRP_REG, tooltip = "Range/ATR below this flags low-volatility compression.")
+i_expandPct   = input.float(1.5,  "Expansion ATR ratio",   minval = 1.0, maxval = 3.0, step = 0.1,  group = GRP_REG)
+
+// --- Continuation scoring & thresholds --------------------------------------
+i_scrSmooth = input.float(0.35, "Score smoothing (alpha)", minval = 0.05, maxval = 1.0, step = 0.05, group = GRP_SCR, tooltip = "EMA-like smoothing applied to the final 0..100 scores.")
+i_thStrong  = input.int(75, "Strong continuation threshold", minval = 50, maxval = 100, group = GRP_SCR)
+i_thCont    = input.int(60, "Continuation threshold",        minval = 40, maxval = 95,  group = GRP_SCR)
+i_thWeak    = input.int(45, "Weakening threshold",           minval = 20, maxval = 80,  group = GRP_SCR)
+
+// --- Historical calibration -------------------------------------------------
+i_calOn      = input.bool(true, "Enable historical calibration", group = GRP_CAL, tooltip = "Reports EMPIRICAL continuation rate per score bucket. Heuristic scores are never relabeled as validated probabilities.")
+i_calHorizon = input.int(10, "Prediction horizon (bars)", minval = 1, maxval = 100, group = GRP_CAL)
+i_calTargetATR  = input.float(1.0, "Target distance (ATR)",  minval = 0.1, maxval = 5.0, step = 0.1, group = GRP_CAL, tooltip = "Event: move at least this many ATR in the signal direction BEFORE moving the adverse distance against it, within the horizon.")
+i_calAdverseATR = input.float(1.0, "Adverse distance (ATR)", minval = 0.1, maxval = 5.0, step = 0.1, group = GRP_CAL)
+i_calMinSample  = input.int(20, "Minimum sample size", minval = 3, maxval = 500, group = GRP_CAL, tooltip = "Buckets with fewer observations are suppressed as unreliable.")
+i_calBucketThresh = input.int(60, "Record signals at/above score", minval = 40, maxval = 95, group = GRP_CAL)
+
+// --- Dashboard --------------------------------------------------------------
+i_dashOn   = input.bool(true, "Show dashboard", group = GRP_DASH)
+i_dashSize = input.string("Normal", "Dashboard size", options = ["Tiny","Small","Normal","Large"], group = GRP_DASH)
+i_dashPos  = input.string("Top Right", "Dashboard position", options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right"], group = GRP_DASH)
+
+// --- Chart visuals ----------------------------------------------------------
+i_visMarkers  = input.bool(true,  "Continuation markers",      group = GRP_VIS)
+i_visWeaken   = input.bool(true,  "Weakening-momentum markers", group = GRP_VIS)
+i_visReversal = input.bool(true,  "Reversal warning markers",  group = GRP_VIS)
+i_visPullback = input.bool(false, "Pullback-within-trend markers", group = GRP_VIS)
+i_visBG       = input.bool(true,  "Background shading (strong conditions)", group = GRP_VIS)
+
+// --- Alerts -----------------------------------------------------------------
+i_alrSens = input.float(1.0, "Alert sensitivity", minval = 0.2, maxval = 3.0, step = 0.1, group = GRP_ALR, tooltip = "Scales the minimum score change required to fire strengthening/weakening alerts.")
+
+// ============================================================================
+// SECTION 1 — SHARED PRIMITIVES / SAFE MATH
+// ============================================================================
+// Bounded clamp helper.
+clamp(float v, float lo, float hi) => math.max(lo, math.min(hi, v))
+
+// Safe division (guards division by zero / na).
+sdiv(float a, float b) => nz(b) == 0.0 ? 0.0 : a / b
+
+// Map an unbounded value through tanh-like squashing into -1..+1.
+squash(float v) => v / (1.0 + math.abs(v))
+
+// Rescale x in [inLo,inHi] to [outLo,outHi], clamped.
+remap(float x, float inLo, float inHi, float outLo, float outHi) =>
+    float t = sdiv(x - inLo, inHi - inLo)
+    outLo + clamp(t, 0.0, 1.0) * (outHi - outLo)
+
+// ATR (used everywhere for normalization). Guarded against zero.
+atr = ta.atr(i_atrLen)
+atrSafe = atr > 0 ? atr : ta.tr(true)
+atrSafe := atrSafe > 0 ? atrSafe : syminfo.mintick * 10
+
+// ============================================================================
+// SECTION 2 — CANDLE ANATOMY ANALYZER (component 1)
+// ============================================================================
+// For each (confirmed) candle produce a normalized set of anatomy features.
+// All ratios are 0..1; ATR-relative measures are unbounded but bounded later.
+rng      = high - low
+body     = math.abs(close - open)
+upWick   = high - math.max(close, open)
+dnWick   = math.min(close, open) - low
+dirSign  = close > open ? 1 : close < open ? -1 : 0
+
+bodyToRange = sdiv(body, rng)
+upToRange   = sdiv(upWick, rng)
+dnToRange   = sdiv(dnWick, rng)
+// Close location: 0 = at low, 1 = at high.
+closeLoc    = sdiv(close - low, rng)
+
+avgBody = ta.sma(body, i_bodyAvgLen)
+rangeVsATR = sdiv(rng, atrSafe)
+bodyVsATR  = sdiv(body, atrSafe)
+bodyVsAvg  = sdiv(body, avgBody)
+
+nearHigh = closeLoc >= 0.75
+nearLow  = closeLoc <= 0.25
+
+// Candle character classification (one dominant label per candle).
+isExpansion   = rangeVsATR >= i_expandPct and bodyToRange >= 0.5
+isContraction = rangeVsATR <= i_compressPct
+isDisplacement= bodyVsATR >= 0.9 and bodyToRange >= 0.6
+isRejection   = (upToRange >= 0.5 or dnToRange >= 0.5) and bodyToRange <= 0.45
+isIndecision  = bodyToRange <= 0.25 and not isRejection
+candleChar = isDisplacement ? "Displacement" : isExpansion ? "Expansion" : isRejection ? "Rejection" : isContraction ? "Compression" : isIndecision ? "Indecision" : "Normal"
+
+// --- Candle directional-quality score (-1..+1) ------------------------------
+// Positive = bullish-supportive candle, negative = bearish-supportive.
+// Combines body quality, close location and net wick bias, weighted by inputs.
+f_candleQuality() =>
+    // Body component: ATR-normalized body, squashed, signed by direction.
+    bodyComp = squash(bodyVsATR) * dirSign * i_wBody
+    // Close-location component centred at mid (0.5 -> 0).
+    closeComp = (closeLoc - 0.5) * 2.0 * i_wClose
+    // Wick bias: lower wick is bullish-supportive, upper wick bearish-supportive.
+    wickComp = (dnToRange - upToRange) * i_wWick
+    raw = bodyComp + closeComp + wickComp
+    clamp(squash(raw * 0.6), -1.0, 1.0)
+candleQuality = f_candleQuality()
+
+// ============================================================================
+// SECTION 3 — DIRECTIONAL EFFICIENCY ANALYZER (component 2)
+// ============================================================================
+// How efficiently price travels in its directional movement for THIS candle.
+//   large body + small opposing wick + close near extreme -> high efficiency
+//   small body + large opposing wick + mid close          -> low efficiency
+// Signed result in -1..+1 (sign = candle direction).
+f_candleEfficiency() =>
+    // Opposing wick = the wick against the candle's direction.
+    oppWick = dirSign > 0 ? upWick : dirSign < 0 ? dnWick : math.max(upWick, dnWick)
+    oppRatio = sdiv(oppWick, rng)
+    extremeCloseness = dirSign > 0 ? closeLoc : dirSign < 0 ? (1.0 - closeLoc) : 0.5
+    eff = bodyToRange * (1.0 - oppRatio) * extremeCloseness
+    clamp(eff, 0.0, 1.0) * dirSign * i_wEff
+candleEff = f_candleEfficiency()
+
+// Net path efficiency over the fast window: |net move| / sum(|per-bar move|).
+f_netEfficiency(int len) =>
+    netMove = close - close[len]
+    float pathSum = 0.0
+    for k = 0 to len - 1
+        pathSum += math.abs(close[k] - close[k + 1])
+    signed = sdiv(netMove, pathSum == 0 ? na : pathSum) // -1..+1 signed
+    nz(signed)
+netEffFast = f_netEfficiency(i_fast)
+netEffMid  = f_netEfficiency(i_mid)
+
+// ============================================================================
+// SECTION 4 — WICK REJECTION / ABSORPTION-LIKE BEHAVIOR (part of anatomy)
+// ============================================================================
+// Rejection evidence, context-weighted. OHLC alone cannot prove order-book
+// absorption, so this is treated strictly as geometric rejection evidence.
+// Returns signed -1..+1 : positive supports bullish, negative supports bearish.
+f_wickRejection() =>
+    // Long lower wick with a close back up = rejection of lower prices (bullish).
+    lowerRej = dnToRange * closeLoc
+    // Long upper wick with a close back down = rejection of higher prices (bearish).
+    upperRej = upToRange * (1.0 - closeLoc)
+    clamp((lowerRej - upperRej) * i_wWick, -1.0, 1.0)
+wickRej = f_wickRejection()
+
+// ============================================================================
+// SECTION 5 — MOMENTUM ENGINE (component 3)
+// ============================================================================
+// Independent assessment of existing directional momentum, -100..+100.
+// Derives primarily from price action (not RSI/MACD/MA).
+
+// Consecutive directional candle run (signed).
+var int consecRun = 0
+if dirSign > 0
+    consecRun := consecRun >= 0 ? consecRun + 1 : 1
+else if dirSign < 0
+    consecRun := consecRun <= 0 ? consecRun - 1 : -1
+else
+    consecRun := 0
+consecComp = squash(consecRun / 4.0) * i_consecW  // -1..+1-ish
+
+// Net displacement across windows, ATR-normalized then squashed.
+dispFast = squash(sdiv(close - close[i_fast], atrSafe) * 0.5 * i_momSens)
+dispMid  = squash(sdiv(close - close[i_mid],  atrSafe) * 0.35 * i_momSens)
+dispSlow = squash(sdiv(close - close[i_slow], atrSafe) * 0.25 * i_momSens)
+
+// Directional body-size consistency: average signed body (ATR-norm) over fast.
+f_bodyConsistency(int len) =>
+    float s = 0.0
+    for k = 0 to len - 1
+        s += (close[k] > open[k] ? 1 : close[k] < open[k] ? -1 : 0) * sdiv(math.abs(close[k] - open[k]), atrSafe)
+    squash(sdiv(s, len) * 1.5)
+bodyConsist = f_bodyConsistency(i_fast)
+
+// Range expansion vs contraction trend (fast avg range vs slow avg range).
+rangeTrend = squash(sdiv(ta.sma(rng, i_fast) - ta.sma(rng, i_slow), atrSafe))
+// Expansion only amplifies momentum in the direction currently dominant.
+rangeTrendSigned = rangeTrend * (dispFast >= 0 ? 1.0 : -1.0)
+
+// Combine momentum sub-features (weighted, then squashed to -1..+1) and scale.
+momRaw = (dispFast * 1.2 + dispMid * 0.9 + dispSlow * 0.6 + consecComp * 0.8 + bodyConsist * 0.9 + netEffFast * i_effW_mom + rangeTrendSigned * 0.4) / 5.8
+momentumScore = clamp(squash(momRaw) * 100.0, -100.0, 100.0)
+
+// Momentum strength 0..1 and direction (used by countertrend dampening).
+momStrength = math.abs(momentumScore) / 100.0
+momDir = momentumScore > 0 ? 1 : momentumScore < 0 ? -1 : 0
+
+// Acceleration: is the impulse accelerating, stable, or weakening?
+momEMAfast = ta.ema(momentumScore, i_fast)
+momEMAslow = ta.ema(momentumScore, i_mid)
+momAccel = momEMAfast - momEMAslow  // >0 strengthening in bullish sense
+
+// ============================================================================
+// SECTION 6 — MARKET STRUCTURE & PULLBACK ANALYZER (component 5)
+// ============================================================================
+// Pivot-based swing tracking. Pivots are confirmed i_pivotLen bars back, so
+// they are non-repainting once formed.
+ph = ta.pivothigh(high, i_pivotLen, i_pivotLen)
+pl = ta.pivotlow(low,  i_pivotLen, i_pivotLen)
+
+var float lastPH  = na
+var float prevPH  = na
+var float lastPL  = na
+var float prevPL  = na
+if not na(ph)
+    prevPH := lastPH
+    lastPH := ph
+if not na(pl)
+    prevPL := lastPL
+    lastPL := pl
+
+higherHigh = not na(lastPH) and not na(prevPH) and lastPH > prevPH
+lowerHigh  = not na(lastPH) and not na(prevPH) and lastPH < prevPH
+higherLow  = not na(lastPL) and not na(prevPL) and lastPL > prevPL
+lowerLow   = not na(lastPL) and not na(prevPL) and lastPL < prevPL
+
+// Structure status: +1 bullish (HH & HL), -1 bearish (LH & LL), 0 mixed.
+structScore = 0.0
+structScore += higherHigh ? 0.5 : 0.0
+structScore += higherLow  ? 0.5 : 0.0
+structScore -= lowerHigh  ? 0.5 : 0.0
+structScore -= lowerLow   ? 0.5 : 0.0
+structScore := clamp(structScore, -1.0, 1.0)
+
+// Structure break detection on the current confirmed bar.
+// Bullish structure break = close below last higher-low.
+bullStructBreak = not na(lastPL) and close < lastPL and close[1] >= lastPL
+bearStructBreak = not na(lastPH) and close > lastPH and close[1] <= lastPH
+
+// --- Pullback depth relative to the preceding impulse -----------------------
+// Impulse = distance of the dominant recent swing; pullback = retrace from the
+// most recent extreme. Expressed as a fraction (0 shallow .. 1+ deep).
+// ta.* must run every bar, so highest/lowest are computed unconditionally.
+recentHigh = ta.highest(high, i_structLB)
+recentLow  = ta.lowest(low,  i_structLB)
+f_pullbackDepth() =>
+    float depth = na
+    if momDir > 0 and not na(lastPL)
+        impulse = recentHigh - lastPL
+        retrace = recentHigh - low
+        depth := sdiv(retrace, impulse == 0 ? na : impulse)
+    else if momDir < 0 and not na(lastPH)
+        impulse = lastPH - recentLow
+        retrace = high - recentLow
+        depth := sdiv(retrace, impulse == 0 ? na : impulse)
+    nz(depth, 0.0)
+pullbackDepth = clamp(f_pullbackDepth(), 0.0, 2.0)
+pullbackLabel = pullbackDepth <= i_pullShallow ? "Shallow" : pullbackDepth <= i_pullDeep ? "Normal" : pullbackDepth <= 1.0 ? "Deep" : "Structural"
+
+structLabel = structScore > 0.25 ? "Bullish (HH/HL)" : structScore < -0.25 ? "Bearish (LH/LL)" : "Mixed"
+
+// ============================================================================
+// SECTION 7 — MARKET REGIME DETECTOR (component 6)
+// ============================================================================
+// Price-path efficiency over the mid window: net progress vs total path.
+pathEff = math.abs(netEffMid)  // 0 = pure chop, 1 = clean directional move
+
+// Overlap: how much consecutive candles overlap (high overlap => chop).
+f_overlap(int len) =>
+    float ov = 0.0
+    for k = 0 to len - 1
+        hi2 = math.min(high[k], high[k + 1])
+        lo2 = math.max(low[k], low[k + 1])
+        inter = math.max(0.0, hi2 - lo2)
+        union = math.max(high[k], high[k + 1]) - math.min(low[k], low[k + 1])
+        ov += sdiv(inter, union == 0 ? na : union)
+    sdiv(ov, len)
+overlap = nz(f_overlap(i_fast))
+
+// Alternation: fraction of direction flips over fast window (chop signal).
+f_altern(int len) =>
+    int flips = 0
+    for k = 0 to len - 2
+        d0 = close[k] > open[k] ? 1 : close[k] < open[k] ? -1 : 0
+        d1 = close[k + 1] > open[k + 1] ? 1 : close[k + 1] < open[k + 1] ? -1 : 0
+        flips += (d0 != 0 and d1 != 0 and d0 != d1) ? 1 : 0
+    sdiv(flips, len - 1)
+altern = nz(f_altern(i_fast))
+
+// Chop score 0..1 : high overlap + high alternation + low path efficiency.
+chopScore = clamp(((overlap * 0.4 + altern * 0.4 + (1.0 - pathEff) * 0.2) * i_chopSens), 0.0, 1.0)
+isChop = chopScore >= 0.6
+
+regime = isChop ? "Chop / Sideways" : rangeVsATR >= i_expandPct and pathEff >= 0.5 ? "Directional Expansion" : pathEff >= 0.45 and not isChop ? "Trending" : pullbackDepth > i_pullShallow and pullbackDepth <= 1.0 and momStrength > 0.2 ? "Pullback in Trend" : rangeVsATR <= i_compressPct ? "Low-Vol Compression" : rangeVsATR >= i_expandPct and pathEff < 0.35 ? "Volatile / Directionless" : "Transition"
+
+// Volatility factor: dampen confidence when big ranges make little net progress.
+volFactor = clamp(1.0 - (1.0 - pathEff) * i_wVol * (rangeVsATR >= i_expandPct ? 0.6 : 0.3), 0.3, 1.0)
+
+// ============================================================================
+// SECTION 8 — CONTEXT-AWARE COUNTERTREND PENALTY ENGINE (component 4)
+// ============================================================================
+// THE core component. Computes how much a candle opposing the established
+// momentum should reduce continuation confidence, using nonlinear scaling and
+// momentum dampening so ordinary countertrend candles are minor while violent
+// ones bite hard.
+//
+// Penalty is expressed on the SAME scale as evidence (roughly -1..+1 impact on
+// the dominant side), returned as a non-negative magnitude plus a signed side.
+
+// Running count of persistent countertrend candles (opposite to momDir).
+var int ctRun = 0
+candleAgainst = momDir > 0 ? dirSign < 0 : momDir < 0 ? dirSign > 0 : false
+ctRun := candleAgainst ? ctRun + 1 : 0
+
+f_countertrendPenalty() =>
+    float pen = 0.0
+    if candleAgainst
+        // 1. Body size of the opposing candle relative to ATR.
+        bodyFactor = clamp(bodyVsATR, 0.0, 3.0)
+        // 2. Close location against the trend (bearish candle closing near low
+        //    is worse for bulls; use directional closeness to the adverse end).
+        adverseClose = momDir > 0 ? (1.0 - closeLoc) : closeLoc  // 1 = closed fully against trend
+        // 3. Wick rejection against the trend (geometry only).
+        adverseWick = momDir > 0 ? upToRange : dnToRange
+        // 4. Engulf / overwhelm: opposing body bigger than prior directional body.
+        priorBody = math.abs(close[1] - open[1])
+        engulf = body > priorBody * 1.1 and ((momDir > 0 and close < math.min(close[1], open[1])) or (momDir < 0 and close > math.max(close[1], open[1]))) ? 1.0 : 0.0
+        // Base severity (0..~1.5) from candle characteristics.
+        base = (bodyFactor * 0.5 + adverseClose * 0.5 + adverseWick * 0.3 + engulf * 0.4)
+        // 5. Persistence: each additional consecutive countertrend candle adds.
+        persist = math.min(ctRun, 6) * 0.12 * i_ctPersistW
+        // 6. Structure break amplifier.
+        brk = (momDir > 0 and bullStructBreak) or (momDir < 0 and bearStructBreak) ? i_structBreakW : 0.0
+        // 7. Pullback depth amplifier (deep / structural pullbacks hurt more).
+        depthAmp = clamp(pullbackDepth, 0.0, 1.5)
+        // 8. Impulse state: a penalty bites more when the impulse is already weakening.
+        weakenAmp = (momDir > 0 and momAccel < 0) or (momDir < 0 and momAccel > 0) ? 0.3 : 0.0
+        severity = base + persist + brk + depthAmp * 0.4 + weakenAmp
+        // Nonlinear scaling: ordinary candles small, extreme candles disproportionate.
+        severityNL = math.pow(severity, i_ctExp)
+        // Momentum dampening: strong established momentum shrinks the penalty of
+        // a SINGLE minor candle, but big severity / persistence overrides it.
+        dampen = 1.0 - i_ctDampen * momStrength * clamp(1.0 - severity * 0.5, 0.0, 1.0)
+        pen := severityNL * dampen * i_ctSens * 0.25
+    clamp(pen, 0.0, 3.0)
+ctPenalty = f_countertrendPenalty()
+// Countertrend pressure readout 0..100 (smoothed for the dashboard).
+ctPressureRaw = clamp(ctPenalty / 2.0, 0.0, 1.0) * 100.0
+ctPressure = ta.ema(ctPressureRaw, i_fast)
+
+// ============================================================================
+// SECTION 9 — MOMENTUM PERSISTENCE / MEMORY ENGINE (component 7)
+// ============================================================================
+// Bounded, EMA-weighted directional "evidence state" in -1..+1. It accumulates
+// pro-trend evidence and is reduced by the countertrend penalty, and decays
+// toward neutral when net progress is weak (chop) — never a permanent bias.
+var float evidenceState = 0.0
+
+// Pro-direction evidence contribution for this bar (-1..+1), combining candle
+// quality, efficiency, wick rejection and structure, aligned to candle dir.
+proEvidence = clamp((candleQuality + candleEff * 0.8 + wickRej * 0.6 + structScore * i_wStruct * 0.5) / 2.9, -1.0, 1.0)
+
+// Signed countertrend impact (reduces state on the side of current momentum).
+ctSigned = momDir > 0 ? -ctPenalty : momDir < 0 ? ctPenalty : 0.0
+
+// EMA update of evidence, then apply countertrend impact, then chop decay.
+evidenceState := (1.0 - i_persAlpha) * evidenceState + i_persAlpha * proEvidence
+evidenceState := evidenceState + ctSigned * 0.5
+// Decay toward zero scaled by how choppy / low-progress the tape is.
+decayPull = i_decay * (0.5 + chopScore)
+evidenceState := evidenceState - evidenceState * clamp(decayPull, 0.0, 0.9)
+evidenceState := clamp(evidenceState, -1.0, 1.0)
+
+// ============================================================================
+// SECTION 10 — BULLISH / BEARISH CONTINUATION SCORING ENGINE (component 8)
+// ============================================================================
+// Two independent 0..100 scores. They need NOT sum to 100.
+// Each blends normalized, weighted, de-duplicated features. Documented weights:
+//   momentum (dir)      0.30  — established directional momentum
+//   evidence state      0.22  — persistent directional memory
+//   candle quality      0.14  — this-bar body/close/wick quality
+//   efficiency          0.12  — directional + net-path efficiency
+//   structure           0.12  — HH/HL or LH/LL progression & pullback hold
+//   wick rejection      0.06  — geometric rejection in favour of direction
+//   less countertrend   0.00  — applied as a subtractive term per side
+// Then scaled by volFactor (regime) and smoothed.
+
+// Normalize momentum into 0..1 per side.
+momBull = clamp(momentumScore / 100.0, 0.0, 1.0)
+momBear = clamp(-momentumScore / 100.0, 0.0, 1.0)
+
+evBull = clamp(evidenceState, 0.0, 1.0)
+evBear = clamp(-evidenceState, 0.0, 1.0)
+
+cqBull = clamp(candleQuality, 0.0, 1.0)
+cqBear = clamp(-candleQuality, 0.0, 1.0)
+
+effSignedTotal = clamp((candleEff + netEffFast) / 2.0, -1.0, 1.0)
+effBull = clamp(effSignedTotal, 0.0, 1.0)
+effBear = clamp(-effSignedTotal, 0.0, 1.0)
+
+strBull = clamp(structScore, 0.0, 1.0)
+strBear = clamp(-structScore, 0.0, 1.0)
+
+wrBull = clamp(wickRej, 0.0, 1.0)
+wrBear = clamp(-wickRej, 0.0, 1.0)
+
+// Pullback "hold" bonus: shallow pullback that holds structure supports continuation.
+holdBonusBull = momDir > 0 and pullbackDepth <= i_pullShallow and not bullStructBreak ? 0.08 : 0.0
+holdBonusBear = momDir < 0 and pullbackDepth <= i_pullShallow and not bearStructBreak ? 0.08 : 0.0
+
+// Countertrend subtraction only applies to the side under pressure.
+ctSubBull = momDir > 0 ? clamp(ctPenalty * 0.18, 0.0, 0.6) : 0.0
+ctSubBear = momDir < 0 ? clamp(ctPenalty * 0.18, 0.0, 0.6) : 0.0
+
+bullRaw = (momBull * 0.30 + evBull * 0.22 + cqBull * 0.14 + effBull * 0.12 + strBull * 0.12 + wrBull * 0.06 + holdBonusBull) * volFactor - ctSubBull
+bearRaw = (momBear * 0.30 + evBear * 0.22 + cqBear * 0.14 + effBear * 0.12 + strBear * 0.12 + wrBear * 0.06 + holdBonusBear) * volFactor - ctSubBear
+
+// In chop, pull both scores toward the middle-low so neither dominates.
+bullRaw := bullRaw * (1.0 - chopScore * 0.5)
+bearRaw := bearRaw * (1.0 - chopScore * 0.5)
+
+bullScoreRaw = clamp(bullRaw * 100.0, 0.0, 100.0)
+bearScoreRaw = clamp(bearRaw * 100.0, 0.0, 100.0)
+
+// Smooth the displayed scores.
+bullScore = ta.ema(bullScoreRaw, math.max(1, int(math.round(1.0 / i_scrSmooth))))
+bearScore = ta.ema(bearScoreRaw, math.max(1, int(math.round(1.0 / i_scrSmooth))))
+
+// ============================================================================
+// SECTION 11 — DIRECTIONAL STATE + CONFIDENCE QUALITY
+// ============================================================================
+dominant = bullScore - bearScore
+state = ""
+if bullScore >= i_thStrong and dominant > 10
+    state := "Strong Bullish Continuation"
+else if bullScore >= i_thCont and dominant > 5
+    state := "Bullish Continuation"
+else if momDir > 0 and (momAccel < 0 or ctPressure > 40) and bullScore >= i_thWeak
+    state := "Weakening Bullish Momentum"
+else if bearScore >= i_thStrong and dominant < -10
+    state := "Strong Bearish Continuation"
+else if bearScore >= i_thCont and dominant < -5
+    state := "Bearish Continuation"
+else if momDir < 0 and (momAccel > 0 or ctPressure > 40) and bearScore >= i_thWeak
+    state := "Weakening Bearish Momentum"
+else
+    state := "Neutral / Choppy"
+
+// Confidence quality: agreement across momentum, structure, evidence, regime.
+agree = 0
+agree += (momDir > 0 and structScore > 0) or (momDir < 0 and structScore < 0) ? 1 : 0
+agree += (momDir > 0 and evidenceState > 0) or (momDir < 0 and evidenceState < 0) ? 1 : 0
+agree += not isChop ? 1 : 0
+agree += math.abs(dominant) > 15 ? 1 : 0
+confQuality = agree >= 3 and not isChop ? "High" : agree >= 2 ? "Moderate" : "Low"
+
+// ============================================================================
+// SECTION 12 — OPTIONAL HISTORICAL OUTCOME CALIBRATION (component 9)
+// ============================================================================
+// Honest, approximate calibration. For each confirmed signal at/above the
+// recording threshold, we snapshot the score & direction, then evaluate the
+// outcome ONLY after the horizon has fully elapsed (no lookahead, no repaint of
+// the displayed score). We tally hits/total per 10-point bucket and report the
+// empirical continuation rate when the sample is large enough.
+//
+// Outcome event (configurable): price moves >= target ATR in the signal
+// direction BEFORE moving >= adverse ATR against it, within the horizon.
+//
+// LIMITATION (documented): overlapping horizons are not statistically
+// independent; treat rates as indicative, not inferential. See README.
+
+// Bucket arrays: index 0=50-59 ... 4=90-100 (bull), plus parallel bear arrays.
+var int[] bullHits  = array.new_int(5, 0)
+var int[] bullTot   = array.new_int(5, 0)
+var int[] bearHits  = array.new_int(5, 0)
+var int[] bearTot   = array.new_int(5, 0)
+
+// Pending queue of open predictions.
+var int[]   pendBucket = array.new_int(0)
+var float[] pendEntry  = array.new_float(0)
+var float[] pendTarget = array.new_float(0)
+var float[] pendAdverse= array.new_float(0)
+var int[]   pendDir    = array.new_int(0)
+var int[]   pendExpiry = array.new_int(0)
+var bool[]  pendHit    = array.new_bool(0)
+var bool[]  pendResolved= array.new_bool(0)
+
+bucketOf(float score) =>
+    score >= 90 ? 4 : score >= 80 ? 3 : score >= 70 ? 2 : score >= 60 ? 1 : score >= 50 ? 0 : -1
+
+if i_calOn and barstate.isconfirmed
+    // (1) Evaluate existing unresolved predictions against THIS bar FIRST, so a
+    //     prediction is never resolved on its own entry bar (no lookahead).
+    if array.size(pendBucket) > 0
+        for idx = 0 to array.size(pendBucket) - 1
+            if not array.get(pendResolved, idx)
+                d   = array.get(pendDir, idx)
+                tgt = array.get(pendTarget, idx)
+                adv = array.get(pendAdverse, idx)
+                targetReached  = d > 0 ? high >= tgt : low <= tgt
+                adverseReached = d > 0 ? low  <= adv : high >= adv
+                if adverseReached and not targetReached
+                    array.set(pendResolved, idx, true)
+                    array.set(pendHit, idx, false)
+                else if targetReached
+                    array.set(pendResolved, idx, true)
+                    array.set(pendHit, idx, true)
+                else if bar_index >= array.get(pendExpiry, idx)
+                    // Horizon elapsed without hitting target -> not continued.
+                    array.set(pendResolved, idx, true)
+                    array.set(pendHit, idx, false)
+                // Commit resolved result into the right bucket exactly once.
+                if array.get(pendResolved, idx)
+                    bk = array.get(pendBucket, idx)
+                    hit = array.get(pendHit, idx)
+                    if d > 0
+                        array.set(bullTot, bk, array.get(bullTot, bk) + 1)
+                        if hit
+                            array.set(bullHits, bk, array.get(bullHits, bk) + 1)
+                    else
+                        array.set(bearTot, bk, array.get(bearTot, bk) + 1)
+                        if hit
+                            array.set(bearHits, bk, array.get(bearHits, bk) + 1)
+
+    // (2) Register a new prediction on a qualifying confirmed signal (AFTER
+    //     evaluation, so it starts being judged from the NEXT bar onward).
+    sigScore = dominant > 0 ? bullScore : bearScore
+    sigDir   = dominant > 0 ? 1 : -1
+    b = bucketOf(sigScore)
+    if b >= 0 and sigScore >= i_calBucketThresh
+        array.push(pendBucket, b)
+        array.push(pendEntry, close)
+        array.push(pendTarget, close + sigDir * i_calTargetATR * atrSafe)
+        array.push(pendAdverse, close - sigDir * i_calAdverseATR * atrSafe)
+        array.push(pendDir, sigDir)
+        array.push(pendExpiry, bar_index + i_calHorizon)
+        array.push(pendHit, false)
+        array.push(pendResolved, false)
+
+    // (3) Prune resolved entries from the FRONT to bound memory/performance.
+    //     Resolved entries always migrate to the front over time because older
+    //     predictions resolve first; shift while the oldest is resolved.
+    while array.size(pendResolved) > 0 and array.get(pendResolved, 0)
+        array.shift(pendBucket)
+        array.shift(pendEntry)
+        array.shift(pendTarget)
+        array.shift(pendAdverse)
+        array.shift(pendDir)
+        array.shift(pendExpiry)
+        array.shift(pendHit)
+        array.shift(pendResolved)
+
+calRate(int[] hits, int[] tot, int bk) =>
+    int t = array.get(tot, bk)
+    t >= i_calMinSample ? sdiv(array.get(hits, bk), t) * 100.0 : na
+calStr(int[] hits, int[] tot, int bk) =>
+    int t = array.get(tot, bk)
+    float r = calRate(hits, tot, bk)
+    na(r) ? "n/a (" + str.tostring(t) + ")" : str.tostring(r, "#.0") + "% (" + str.tostring(t) + ")"
+
+// ============================================================================
+// SECTION 13 — CHART VISUALIZATIONS (component 10, part 1)
+// ============================================================================
+colBull = color.new(color.teal, 0)
+colBear = color.new(color.red, 0)
+colWeak = color.new(color.orange, 0)
+colNeutral = color.new(color.gray, 0)
+
+bgTransp = 85
+bgCol = i_visBG ? (state == "Strong Bullish Continuation" ? color.new(color.teal, bgTransp) : state == "Strong Bearish Continuation" ? color.new(color.red, bgTransp) : na) : na
+bgcolor(bgCol, title = "Strong-condition shading")
+
+// Edge-triggered markers (fire only on the bar the condition first becomes true).
+strongBullNow = state == "Strong Bullish Continuation"
+strongBearNow = state == "Strong Bearish Continuation"
+contBullNow   = state == "Bullish Continuation"
+contBearNow   = state == "Bearish Continuation"
+weakBullNow   = state == "Weakening Bullish Momentum"
+weakBearNow   = state == "Weakening Bearish Momentum"
+
+newContBull = i_visMarkers and (contBullNow or strongBullNow) and not (contBullNow[1] or strongBullNow[1])
+newContBear = i_visMarkers and (contBearNow or strongBearNow) and not (contBearNow[1] or strongBearNow[1])
+plotshape(newContBull, title = "Bullish continuation", style = shape.triangleup,   location = location.belowbar, color = colBull, size = size.tiny)
+plotshape(newContBear, title = "Bearish continuation", style = shape.triangledown, location = location.abovebar, color = colBear, size = size.tiny)
+
+newWeakBull = i_visWeaken and weakBullNow and not weakBullNow[1]
+newWeakBear = i_visWeaken and weakBearNow and not weakBearNow[1]
+plotshape(newWeakBull, title = "Weakening bullish", style = shape.circle, location = location.abovebar, color = colWeak, size = size.tiny)
+plotshape(newWeakBear, title = "Weakening bearish", style = shape.circle, location = location.belowbar, color = colWeak, size = size.tiny)
+
+// Reversal warnings: strong opposing displacement + structure break vs prior trend.
+revBull = i_visReversal and bearStructBreak and momDir[1] < 0 and candleQuality > 0.4 and bodyVsATR > 1.2
+revBear = i_visReversal and bullStructBreak and momDir[1] > 0 and candleQuality < -0.4 and bodyVsATR > 1.2
+plotshape(revBull, title = "Potential bullish reversal", style = shape.labelup,   location = location.belowbar, color = color.new(color.lime, 0), textcolor = color.white, text = "R", size = size.tiny)
+plotshape(revBear, title = "Potential bearish reversal", style = shape.labeldown, location = location.abovebar, color = color.new(color.maroon, 0), textcolor = color.white, text = "R", size = size.tiny)
+
+// Pullback-within-trend markers.
+pbBull = i_visPullback and momDir > 0 and pullbackLabel == "Shallow" and candleAgainst
+pbBear = i_visPullback and momDir < 0 and pullbackLabel == "Shallow" and candleAgainst
+plotshape(pbBull, title = "Pullback in bull trend", style = shape.xcross, location = location.belowbar, color = color.new(color.blue, 30), size = size.tiny)
+plotshape(pbBear, title = "Pullback in bear trend", style = shape.xcross, location = location.abovebar, color = color.new(color.blue, 30), size = size.tiny)
+
+// ============================================================================
+// SECTION 14 — DASHBOARD (component 10, part 2)
+// ============================================================================
+f_sz(string s) => s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Large" ? size.large : size.normal
+f_pos(string p) => p == "Top Left" ? position.top_left : p == "Bottom Right" ? position.bottom_right : p == "Bottom Left" ? position.bottom_left : p == "Middle Right" ? position.middle_right : position.top_right
+
+stateCol = state == "Strong Bullish Continuation" or state == "Bullish Continuation" ? colBull : state == "Strong Bearish Continuation" or state == "Bearish Continuation" ? colBear : state == "Weakening Bullish Momentum" or state == "Weakening Bearish Momentum" ? colWeak : colNeutral
+
+var table dash = na
+if i_dashOn and na(dash)
+    dash := table.new(f_pos(i_dashPos), 2, 13, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 40))
+
+f_row(table t, int r, string k, string v, color vc) =>
+    table.cell(t, 0, r, k, text_size = f_sz(i_dashSize), text_color = color.new(color.white, 0), text_halign = text.align_left, bgcolor = color.new(color.black, 60))
+    table.cell(t, 1, r, v, text_size = f_sz(i_dashSize), text_color = vc, text_halign = text.align_right, bgcolor = color.new(color.black, 75))
+
+if i_dashOn and barstate.islast
+    table.cell(dash, 0, 0, "PACPE", text_size = f_sz(i_dashSize), text_color = color.white, bgcolor = color.new(color.blue, 20))
+    table.cell(dash, 1, 0, confQuality + " conf", text_size = f_sz(i_dashSize), text_color = confQuality == "High" ? color.lime : confQuality == "Moderate" ? color.orange : color.gray, bgcolor = color.new(color.blue, 20))
+    f_row(dash, 1,  "State",            state, stateCol)
+    f_row(dash, 2,  "Bull Cont. Score", str.tostring(bullScore, "#.0"), colBull)
+    f_row(dash, 3,  "Bear Cont. Score", str.tostring(bearScore, "#.0"), colBear)
+    f_row(dash, 4,  "Momentum",         str.tostring(momentumScore, "#.0"), momentumScore > 0 ? colBull : momentumScore < 0 ? colBear : colNeutral)
+    f_row(dash, 5,  "Regime",           regime, colNeutral)
+    f_row(dash, 6,  "Pullback",         pullbackLabel + " (" + str.tostring(pullbackDepth, "#.00") + ")", colNeutral)
+    f_row(dash, 7,  "Structure",        structLabel, structScore > 0 ? colBull : structScore < 0 ? colBear : colNeutral)
+    f_row(dash, 8,  "Countertrend",     str.tostring(ctPressure, "#.0"), ctPressure > 40 ? colWeak : colNeutral)
+    f_row(dash, 9,  "Candle",           candleChar, colNeutral)
+    // Calibration rows (empirical rates; clearly labelled, never as the score).
+    if i_calOn
+        bbk = bucketOf(bullScore)
+        rbk = bucketOf(bearScore)
+        f_row(dash, 10, "Bull emp. rate", bbk >= 0 ? calStr(bullHits, bullTot, bbk) : "-", color.new(color.teal, 0))
+        f_row(dash, 11, "Bear emp. rate", rbk >= 0 ? calStr(bearHits, bearTot, rbk) : "-", color.new(color.red, 0))
+        table.cell(dash, 0, 12, "Scores are heuristic", text_size = f_sz(i_dashSize), text_color = color.new(color.silver, 20), text_halign = text.align_left, bgcolor = color.new(color.black, 80))
+        table.cell(dash, 1, 12, "rates = empirical", text_size = f_sz(i_dashSize), text_color = color.new(color.silver, 20), text_halign = text.align_right, bgcolor = color.new(color.black, 80))
+    else
+        f_row(dash, 10, "Calibration", "off", colNeutral)
+        f_row(dash, 11, "Scores", "heuristic", colNeutral)
+        table.cell(dash, 0, 12, "", text_size = f_sz(i_dashSize), bgcolor = color.new(color.black, 80))
+        table.cell(dash, 1, 12, "", text_size = f_sz(i_dashSize), bgcolor = color.new(color.black, 80))
+
+// ============================================================================
+// SECTION 15 — SMALL INDICATOR PANEL PLOTS (hidden by default via overlay)
+// ============================================================================
+// These plot the three core series so users can read them in the Data Window
+// (and optionally move them to a separate pane). They use display.data_window
+// so they do not clutter the price chart.
+plot(bullScore,     "Bullish Continuation Score", color = colBull,     display = display.data_window)
+plot(bearScore,     "Bearish Continuation Score", color = colBear,     display = display.data_window)
+plot(momentumScore, "Momentum Score (-100..100)", color = color.yellow, display = display.data_window)
+plot(ctPressure,    "Countertrend Pressure",      color = colWeak,     display = display.data_window)
+
+// ============================================================================
+// SECTION 16 — ALERT ENGINE (component 11)
+// ============================================================================
+// Confirmed-bar conditions; edge-triggered to avoid firing every bar.
+minDelta = 3.0 * i_alrSens
+bullStrengthen = barstate.isconfirmed and bullScore - bullScore[1] >= minDelta and bullScore >= i_thWeak
+bearStrengthen = barstate.isconfirmed and bearScore - bearScore[1] >= minDelta and bearScore >= i_thWeak
+bullWeaken     = barstate.isconfirmed and weakBullNow and not weakBullNow[1]
+bearWeaken     = barstate.isconfirmed and weakBearNow and not weakBearNow[1]
+toChop         = barstate.isconfirmed and isChop and not isChop[1]
+toBullRev      = barstate.isconfirmed and revBull
+toBearRev      = barstate.isconfirmed and revBear
+bullCross      = barstate.isconfirmed and ta.crossover(bullScore, float(i_thStrong))
+bearCross      = barstate.isconfirmed and ta.crossover(bearScore, float(i_thStrong))
+
+alertcondition(bullStrengthen, "Bullish continuation strengthening", "PACPE: bullish continuation strengthening")
+alertcondition(bearStrengthen, "Bearish continuation strengthening", "PACPE: bearish continuation strengthening")
+alertcondition(bullWeaken,     "Bullish momentum weakening",         "PACPE: bullish momentum weakening")
+alertcondition(bearWeaken,     "Bearish momentum weakening",         "PACPE: bearish momentum weakening")
+alertcondition(toChop,         "Trend to chop transition",           "PACPE: transition from trend to chop")
+alertcondition(toBullRev,      "Potential bearish-to-bullish",       "PACPE: potential bearish-to-bullish transition")
+alertcondition(toBearRev,      "Potential bullish-to-bearish",       "PACPE: potential bullish-to-bearish transition")
+alertcondition(bullCross,      "Bullish score crossed strong",       "PACPE: bullish continuation score crossed strong threshold")
+alertcondition(bearCross,      "Bearish score crossed strong",       "PACPE: bearish continuation score crossed strong threshold")
